@@ -12,7 +12,7 @@ Help Project Managers analyze multiple project documents and identify Risks, Ass
 
 - Python for core application logic
 - LangGraph for agent workflow and state management  
-- OpenAI API for real LLM reasoning
+- Configurable LLM provider for real AI reasoning
 - Streamlit for the user interface
 
 ## Functional Requirements
@@ -35,7 +35,7 @@ Help Project Managers analyze multiple project documents and identify Risks, Ass
 #### Acceptance Criteria
 
 1. WHEN documents are processed THEN the system SHALL use LangGraph workflow to orchestrate the analysis
-2. WHEN analyzing content THEN the system SHALL invoke the OpenAI API for actual LLM reasoning
+2. WHEN analyzing content THEN the system SHALL invoke the configured LLM provider for actual LLM reasoning
 3. WHEN identifying RAID items THEN the system SHALL base findings on document evidence rather than hardcoded keyword rules
 4. WHEN generating findings THEN the system SHALL provide descriptions, classifications, supporting evidence, impacts, and recommended actions
 
@@ -101,8 +101,8 @@ Help Project Managers analyze multiple project documents and identify Risks, Ass
 #### Acceptance Criteria
 
 1. WHEN the application starts THEN it SHALL run locally without requiring cloud deployment or databases
-2. WHEN connecting to AI services THEN the system SHALL require internet connection to OpenAI API only
-3. WHEN configuring THEN the system SHALL use environment variables for API credentials without hardcoding keys
+2. WHEN connecting to AI services THEN the system SHALL require internet connection to the configured LLM provider only
+3. WHEN configuring THEN the system SHALL use environment variables for LLM provider selection and API credentials without hardcoding keys
 4. WHEN installed THEN the system SHALL include sample project documents and basic end-to-end tests
 
 ## Non-Functional Requirements
@@ -128,12 +128,15 @@ Help Project Managers analyze multiple project documents and identify Risks, Ass
 - Must be standalone Python application
 - No authentication system required for MVP
 - No cloud deployment or database requirements
-- Must use specified tech stack (Python, LangGraph, OpenAI API, Streamlit)
+- Must use specified tech stack (Python, LangGraph, Streamlit)
+- Must use configurable LLM provider (MVP implements one provider selected through environment configuration)
+- LLM integration should be loosely coupled to allow future provider additions
+- Switching to unimplemented LLM providers is not supported in MVP
 
 ## Success Criteria
 
 - Application runs independently of Kiro
-- LangGraph workflow successfully invokes OpenAI API
+- LangGraph workflow successfully invokes configured LLM provider
 - RAID findings are evidence-based, not rule-based
 - No RAID item exports without PM approval
 - Includes sample documents and end-to-end test
