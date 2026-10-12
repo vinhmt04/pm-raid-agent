@@ -98,25 +98,10 @@ class TestRAIDWorkflow:
         assert thread_config["configurable"]["thread_id"] == session_id
     
     def test_resume_workflow(self, raid_workflow):
-        """Test resuming workflow with review decisions."""
-        session_id = "test_session_123"
-        review_decisions = {
-            "finding_1": "approved",
-            "finding_2": "rejected"
-        }
-        
-        result = raid_workflow.resume_workflow(session_id, review_decisions)
-        
-        # Verify result structure
-        assert "thread_config" in result
-        assert "update_state" in result
-        
-        # Verify update state
-        update_state = result["update_state"]
-        assert update_state["review_decisions"] == review_decisions
-        assert update_state["approval_complete"] is True
-        assert "last_updated_at" in update_state
-    
+        """Cannot resume a session that has not reached an interrupt."""
+        with pytest.raises(ValueError, match="No pending review interrupt"):
+            raid_workflow.resume_workflow("test_session_123", {"finding_1": "approved"})
+
     def test_analyze_individual_documents_node(self, raid_workflow, sample_documents):
         """Test individual document analysis node."""
         # Create workflow state
@@ -250,92 +235,35 @@ class TestRAIDWorkflow:
         assert "last_updated_at" in updates
     
     def test_manage_review_approval_initial(self, raid_workflow):
-        """Test review and approval management node - initial setup."""
         from src.workflow.raid_state_manager import RAIDStateManager
-        
-        # Create RAID state manager with pending findings
-        raid_state_manager = RAIDStateManager()
-        test_finding = RAIDFinding(
-            type=RAIDType.RISK,
-            description="Test risk finding",
+        manager = RAIDStateManager()
+        finding = RAIDFinding(type=RAIDType.RISK, description="Test risk",
             evidence_type=EvidenceType.INFERENCE,
-            source_citations=[SourceCitation("test.pdf", "Page 1", "Sample text")]
-        )
-        raid_state_manager.add_finding(test_finding)
-        
-        # Create workflow state (initial review setup)
-        state = WorkflowState(
-            documents=[],
-            individual_analyses=[],
-            cross_document_synthesis=None,
-            raid_state_manager=raid_state_manager,
-            current_phase="review",
-            workflow_status="in_progress",
-            error_messages=[],
-            llm_provider_config=raid_workflow.llm_provider_config,
-            llm_conversation_history=[],
-            session_id="test_session",
-            workflow_started_at=datetime.now(),
-            last_updated_at=datetime.now(),
-            pending_review_findings=[],
-            review_decisions={},
-            approval_complete=False
-        )
-        
-        # Execute node
-        updates = raid_workflow.manage_review_approval(state)
-        
-        # Verify updates
-        assert "pending_review_findings" in updates
-        assert "workflow_status" in updates
-        assert updates["workflow_status"] == "awaiting_review"
-        assert len(updates["pending_review_findings"]) == 1
-    
+            source_citations=[SourceCitation("test.pdf", "Page 1", "Sample text")])
+        manager.add_finding(finding)
+        graph = _review_only_graph(raid_workflow)
+        config = {"configurable": {"thread_id": "unit_review_initial"}}
+        result = graph.invoke({"raid_state_manager": manager, "session_id": "unit_review_initial"}, config=config)
+        assert result.get("__interrupt__")
+        snapshot = graph.get_state(config)
+        assert snapshot.next == ("review_management",)
+        assert snapshot.tasks[0].interrupts[0].value["pending_review_findings"] == [finding.id]
+        assert snapshot.values["raid_state_manager"].get_finding(finding.id).status.value == "pending"
+
     def test_manage_review_approval_processing(self, raid_workflow):
-        """Test review and approval management node - processing decisions."""
         from src.workflow.raid_state_manager import RAIDStateManager
-        
-        # Create RAID state manager with pending findings
-        raid_state_manager = RAIDStateManager()
-        test_finding = RAIDFinding(
-            type=RAIDType.RISK,
-            description="Test risk finding",
+        manager = RAIDStateManager()
+        finding = RAIDFinding(type=RAIDType.RISK, description="Test risk",
             evidence_type=EvidenceType.INFERENCE,
-            source_citations=[SourceCitation("test.pdf", "Page 1", "Sample text")]
-        )
-        finding_id = raid_state_manager.add_finding(test_finding)
-        
-        # Create workflow state (processing decisions)
-        state = WorkflowState(
-            documents=[],
-            individual_analyses=[],
-            cross_document_synthesis=None,
-            raid_state_manager=raid_state_manager,
-            current_phase="review",
-            workflow_status="awaiting_review",
-            error_messages=[],
-            llm_provider_config=raid_workflow.llm_provider_config,
-            llm_conversation_history=[],
-            session_id="test_session",
-            workflow_started_at=datetime.now(),
-            last_updated_at=datetime.now(),
-            pending_review_findings=[finding_id],
-            review_decisions={finding_id: "approved"},
-            approval_complete=True
-        )
-        
-        # Execute node
-        updates = raid_workflow.manage_review_approval(state)
-        
-        # Verify updates
-        assert "workflow_status" in updates
-        assert "current_phase" in updates
-        assert updates["workflow_status"] == "completed"
-        assert updates["current_phase"] == "completed"
-        
-        # Verify finding was approved
-        finding = raid_state_manager.get_finding(finding_id)
-        assert finding.status.value == "approved"
+            source_citations=[SourceCitation("test.pdf", "Page 1", "Sample text")])
+        manager.add_finding(finding)
+        graph = _review_only_graph(raid_workflow)
+        session_id = "unit_review_processing"
+        config = {"configurable": {"thread_id": session_id}}
+        graph.invoke({"raid_state_manager": manager, "session_id": session_id}, config=config)
+        result = raid_workflow.resume_workflow(session_id, {finding.id: "approved"})
+        assert result["state"]["workflow_status"] == "completed"
+        assert result["state"]["raid_state_manager"].get_finding(finding.id).status.value == "approved"
 
 
 class TestWorkflowState:
@@ -423,3 +351,13 @@ class TestCrossDocumentSynthesis:
         assert len(synthesis.relationships_identified) == 1
         assert synthesis.contradictions_found == []
         assert synthesis.synthesis_summary == "Test synthesis"
+
+def _review_only_graph(workflow):
+    """Run the real LangGraph node in its interrupt-capable context."""
+    from langgraph.graph import StateGraph, END
+    graph = StateGraph(WorkflowState)
+    graph.add_node("review_management", workflow.manage_review_approval)
+    graph.set_entry_point("review_management")
+    graph.add_edge("review_management", END)
+    workflow.graph = graph.compile(checkpointer=workflow.checkpointer)
+    return workflow.graph

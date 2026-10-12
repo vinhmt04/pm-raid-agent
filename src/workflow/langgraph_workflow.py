@@ -11,7 +11,9 @@ import sys
 from pathlib import Path
 
 from langgraph.graph import StateGraph, END
+from langgraph.types import interrupt, Command
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.prebuilt import ToolNode
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
 
@@ -120,7 +122,11 @@ class RAIDWorkflow:
             llm_provider_config: Configuration for LLM provider integration
         """
         self.llm_provider_config = llm_provider_config
-        self.checkpointer = MemorySaver()  # InMemorySaver for session persistence
+        # MVP-only: checkpoints are in-memory and contain trusted Python objects
+        # (RAIDStateManager, DocumentMetadata, RAIDFinding). The default
+        # msgpack serializer cannot encode them. Never use pickle fallback
+        # for untrusted or shared checkpoint storage.
+        self.checkpointer = MemorySaver(serde=JsonPlusSerializer(pickle_fallback=True))
         self.graph = self._build_workflow_graph()
         
         logger.info("RAIDWorkflow initialized", 
@@ -198,34 +204,30 @@ class RAIDWorkflow:
         }
     
     def resume_workflow(self, session_id: str, review_decisions: Dict[str, str]) -> Dict[str, Any]:
-        """
-        Resume workflow after human review with approval decisions.
-        
-        Args:
-            session_id: Session identifier
-            review_decisions: Dictionary mapping finding IDs to approval decisions
-            
-        Returns:
-            Updated workflow state and continuation info
+        """Resume an interrupted graph with explicit PM decisions.
+
+        Every pending finding needs an explicit decision. Invalid or partial
+        submissions are rejected before resuming the graph.
         """
         thread_config = {"configurable": {"thread_id": session_id}}
-        
-        # Update state with review decisions
-        update_state = {
-            "review_decisions": review_decisions,
-            "approval_complete": True,
-            "last_updated_at": datetime.now()
-        }
-        
-        logger.info("Workflow resumed with review decisions",
-                   session_id=session_id,
-                   decisions_count=len(review_decisions))
-        
-        return {
-            "thread_config": thread_config,
-            "update_state": update_state
-        }
-    
+        snapshot = self.graph.get_state(thread_config)
+        if not snapshot or not snapshot.values or not snapshot.tasks or not any(
+            task.interrupts for task in snapshot.tasks
+        ):
+            raise ValueError("No pending review interrupt for this session")
+        if not isinstance(review_decisions, dict):
+            raise ValueError("Review decisions must be a dictionary")
+        manager = snapshot.values["raid_state_manager"]
+        pending = {finding.id for finding in manager.get_pending_findings()}
+        if set(review_decisions) != pending or any(
+            not isinstance(decision, str) or decision.lower() not in {"approved", "rejected"}
+            for decision in review_decisions.values()
+        ):
+            raise ValueError("Every pending finding requires an explicit approve/reject decision")
+        result = self.graph.invoke(Command(resume=review_decisions), config=thread_config)
+        return {"thread_config": thread_config, "result": result,
+                "state": self.graph.get_state(thread_config).values}
+
     # Workflow Node Functions
     
     def analyze_individual_documents(self, state: WorkflowState) -> Dict[str, Any]:
@@ -395,80 +397,42 @@ class RAIDWorkflow:
             }
     
     def manage_review_approval(self, state: WorkflowState) -> Dict[str, Any]:
+        """Pause the graph for explicit PM decisions; edits never imply approval.
+
+        interrupt() must not be swallowed by an exception handler. The node
+        restarts on resume, so decisions are applied only after the interrupt.
         """
-        Node 4: Review and Approval Management
-        
-        Present findings for PM review with approve/reject options.
-        Use interrupt() to pause for review and Command(resume=...) for approval decisions.
-        
-        Args:
-            state: Current workflow state
-            
-        Returns:
-            State updates with review management
-        """
-        logger.info("Starting review and approval management")
-        
-        try:
-            # Check if this is initial review setup or processing decisions
-            if not state.get("approval_complete", False):
-                # Initial setup - prepare findings for review
-                pending_findings = state["raid_state_manager"].get_pending_findings()
-                pending_ids = [finding.id for finding in pending_findings]
-                
-                updates = {
-                    "pending_review_findings": pending_ids,
-                    "workflow_status": "awaiting_review",
-                    "last_updated_at": datetime.now()
-                }
-                
-                logger.info("Findings prepared for review",
-                           pending_count=len(pending_ids))
-                
-                # This would trigger interrupt() in actual LangGraph execution
-                # The workflow pauses here until resume_workflow() is called
-                return updates
-            
+        manager = state["raid_state_manager"]
+        pending = manager.get_pending_findings()
+        if not pending:
+            return {"pending_review_findings": [], "review_decisions": {},
+                    "approval_complete": True, "workflow_status": "completed",
+                    "current_phase": "completed", "last_updated_at": datetime.now()}
+
+        pending_ids = [finding.id for finding in pending]
+        decisions = interrupt({
+            "status": "awaiting_review",
+            "session_id": state["session_id"],
+            "findings": [finding.to_dict() for finding in pending],
+            "pending_review_findings": pending_ids,
+        })
+        if not isinstance(decisions, dict) or set(decisions) != set(pending_ids) or any(
+            not isinstance(decision, str) or decision.lower() not in {"approved", "rejected"}
+            for decision in decisions.values()
+        ):
+            raise ValueError("Every pending finding requires an explicit decision")
+
+        for finding_id, decision in decisions.items():
+            finding = manager.get_finding(finding_id)
+            if decision.lower() == "approved":
+                finding.approve()
             else:
-                # Process review decisions
-                review_decisions = state.get("review_decisions", {})
-                
-                # Apply approval decisions to findings
-                approved_count = 0
-                rejected_count = 0
-                
-                for finding_id, decision in review_decisions.items():
-                    finding = state["raid_state_manager"].get_finding(finding_id)
-                    if finding:
-                        if decision.lower() == "approved":
-                            finding.approve()
-                            approved_count += 1
-                        elif decision.lower() == "rejected":
-                            finding.reject()
-                            rejected_count += 1
-                
-                updates = {
-                    "workflow_status": "completed",
-                    "current_phase": "completed",
-                    "last_updated_at": datetime.now()
-                }
-                
-                logger.info("Review decisions processed",
-                           approved_count=approved_count,
-                           rejected_count=rejected_count)
-                
-                return updates
-        
-        except Exception as e:
-            error_msg = f"Review management failed: {str(e)}"
-            logger.error("Review management failed", error=str(e))
-            
-            return {
-                "error_messages": state.get("error_messages", []) + [error_msg],
-                "workflow_status": "error",
-                "last_updated_at": datetime.now()
-            }
-    
+                finding.reject()
+
+        return {"raid_state_manager": manager, "review_decisions": decisions, "pending_review_findings": [],
+                "approval_complete": True, "workflow_status": "completed",
+                "current_phase": "completed", "last_updated_at": datetime.now()}
+
     # Helper Methods for LLM Integration
     
     def _analyze_single_document(self,
