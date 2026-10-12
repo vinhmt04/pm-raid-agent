@@ -638,3 +638,208 @@ class TestIterationAndContainment(TestRAIDStateManager):
         
         for i, finding in enumerate(iterated_findings):
             assert finding.id == sample_findings[i].id
+
+
+class TestAdvancedValidationAndEdgeCases(TestRAIDStateManager):
+    """Test advanced validation scenarios and edge cases for comprehensive coverage."""
+    
+    def test_status_transition_validation_sequence(self, state_manager, sample_finding):
+        """Test complete status transition sequence with validation."""
+        state_manager.add_finding(sample_finding)
+        
+        # Initial status should be pending
+        finding = state_manager.get_finding(sample_finding.id)
+        assert finding.status == Status.PENDING
+        
+        # Transition to approved
+        result = state_manager.update_finding(sample_finding.id, status=Status.APPROVED)
+        assert result is True
+        finding = state_manager.get_finding(sample_finding.id)
+        assert finding.status == Status.APPROVED
+        
+        # Transition to rejected
+        result = state_manager.update_finding(sample_finding.id, status=Status.REJECTED)
+        assert result is True
+        finding = state_manager.get_finding(sample_finding.id)
+        assert finding.status == Status.REJECTED
+        
+        # Transition back to pending (reset scenario)
+        result = state_manager.update_finding(sample_finding.id, status=Status.PENDING)
+        assert result is True
+        finding = state_manager.get_finding(sample_finding.id)
+        assert finding.status == Status.PENDING
+    
+    def test_relationship_consistency_validation(self, state_manager, sample_findings):
+        """Test that relationships maintain consistency across operations."""
+        # Add all findings
+        for finding in sample_findings:
+            state_manager.add_finding(finding)
+        
+        finding1_id, finding2_id, finding3_id = [f.id for f in sample_findings]
+        
+        # Create a chain of relationships: 1 -> 2 -> 3
+        state_manager.add_relationship(finding1_id, finding2_id)
+        state_manager.add_relationship(finding2_id, finding3_id)
+        
+        # Verify relationship consistency
+        related_to_1 = state_manager.get_related_findings(finding1_id)
+        related_to_2 = state_manager.get_related_findings(finding2_id)
+        related_to_3 = state_manager.get_related_findings(finding3_id)
+        
+        assert len(related_to_1) == 1 and related_to_1[0].id == finding2_id
+        assert len(related_to_2) == 2  # Connected to both 1 and 3
+        assert len(related_to_3) == 1 and related_to_3[0].id == finding2_id
+        
+        # Verify findings' internal related_items lists are consistent
+        finding1 = state_manager.get_finding(finding1_id)
+        finding2 = state_manager.get_finding(finding2_id)
+        finding3 = state_manager.get_finding(finding3_id)
+        
+        assert finding2_id in finding1.related_items
+        assert finding1_id in finding2.related_items
+        assert finding3_id in finding2.related_items
+        assert finding2_id in finding3.related_items
+    
+    def test_bulk_operations_with_mixed_statuses(self, state_manager, sample_findings):
+        """Test bulk operations behavior with findings in different statuses."""
+        for finding in sample_findings:
+            state_manager.add_finding(finding)
+        
+        finding_ids = [f.id for f in sample_findings]
+        
+        # Set different initial statuses
+        state_manager.update_finding(finding_ids[0], status=Status.APPROVED)
+        state_manager.update_finding(finding_ids[1], status=Status.REJECTED) 
+        # finding_ids[2] remains PENDING
+        
+        # Test bulk approve on mixed statuses
+        results = state_manager.bulk_approve_findings(finding_ids)
+        
+        # All should succeed regardless of previous status
+        for finding_id in finding_ids:
+            assert results[finding_id] is True
+            finding = state_manager.get_finding(finding_id)
+            assert finding.status == Status.APPROVED
+        
+        # Test bulk reject on all approved findings
+        results = state_manager.bulk_reject_findings(finding_ids)
+        
+        for finding_id in finding_ids:
+            assert results[finding_id] is True
+            finding = state_manager.get_finding(finding_id)
+            assert finding.status == Status.REJECTED
+    
+    def test_filtering_with_complex_criteria(self, state_manager, sample_findings):
+        """Test filtering with multiple criteria combinations."""
+        for finding in sample_findings:
+            state_manager.add_finding(finding)
+        
+        # Add relationships and set different statuses
+        state_manager.add_relationship(sample_findings[0].id, sample_findings[1].id)
+        state_manager.update_finding(sample_findings[0].id, status=Status.APPROVED)
+        
+        # Test compound filtering scenarios
+        approved_with_relationships = state_manager.filter_findings(
+            status=Status.APPROVED, 
+            has_relationships=True
+        )
+        assert len(approved_with_relationships) == 1
+        assert approved_with_relationships[0].id == sample_findings[0].id
+        
+        pending_without_relationships = state_manager.filter_findings(
+            status=Status.PENDING,
+            has_relationships=False
+        )
+        assert len(pending_without_relationships) == 1  # Only finding[2] matches
+        assert pending_without_relationships[0].id == sample_findings[2].id
+    
+    def test_state_export_import_with_complex_relationships(self, state_manager, sample_findings):
+        """Test state export/import preserves complex relationship structures."""
+        for finding in sample_findings:
+            state_manager.add_finding(finding)
+        
+        finding_ids = [f.id for f in sample_findings]
+        
+        # Create complex relationship network
+        state_manager.add_relationship(finding_ids[0], finding_ids[1])
+        state_manager.add_relationship(finding_ids[1], finding_ids[2])
+        state_manager.add_relationship(finding_ids[0], finding_ids[2])  # Triangle
+        
+        # Set mixed statuses
+        state_manager.update_finding(finding_ids[0], status=Status.APPROVED)
+        state_manager.update_finding(finding_ids[1], status=Status.REJECTED)
+        
+        # Export state
+        exported_state = state_manager.export_state()
+        
+        # Import into new manager
+        new_manager = RAIDStateManager()
+        new_manager.import_state(exported_state)
+        
+        # Verify complex relationships preserved
+        for finding_id in finding_ids:
+            original_related = state_manager.get_related_findings(finding_id)
+            imported_related = new_manager.get_related_findings(finding_id)
+            
+            assert len(original_related) == len(imported_related)
+            original_ids = {f.id for f in original_related}
+            imported_ids = {f.id for f in imported_related}
+            assert original_ids == imported_ids
+        
+        # Verify statuses preserved
+        assert new_manager.get_finding(finding_ids[0]).status == Status.APPROVED
+        assert new_manager.get_finding(finding_ids[1]).status == Status.REJECTED
+        assert new_manager.get_finding(finding_ids[2]).status == Status.PENDING
+    
+    def test_concurrent_relationship_operations(self, state_manager, sample_findings):
+        """Test relationship operations don't interfere with each other."""
+        for finding in sample_findings:
+            state_manager.add_finding(finding)
+        
+        finding_ids = [f.id for f in sample_findings]
+        
+        # Add multiple relationships simultaneously  
+        result1 = state_manager.add_relationship(finding_ids[0], finding_ids[1])
+        result2 = state_manager.add_relationship(finding_ids[0], finding_ids[2])
+        result3 = state_manager.add_relationship(finding_ids[1], finding_ids[2])
+        
+        assert all([result1, result2, result3])
+        
+        # Verify all relationships exist
+        related_to_0 = state_manager.get_related_findings(finding_ids[0])
+        related_to_1 = state_manager.get_related_findings(finding_ids[1]) 
+        related_to_2 = state_manager.get_related_findings(finding_ids[2])
+        
+        assert len(related_to_0) == 2  # Connected to 1 and 2
+        assert len(related_to_1) == 2  # Connected to 0 and 2
+        assert len(related_to_2) == 2  # Connected to 0 and 1
+        
+        # Remove one relationship and verify others remain
+        state_manager.remove_relationship(finding_ids[0], finding_ids[1])
+        
+        related_to_0 = state_manager.get_related_findings(finding_ids[0])
+        related_to_1 = state_manager.get_related_findings(finding_ids[1])
+        related_to_2 = state_manager.get_related_findings(finding_ids[2])
+        
+        assert len(related_to_0) == 1 and related_to_0[0].id == finding_ids[2]
+        assert len(related_to_1) == 1 and related_to_1[0].id == finding_ids[2]
+        assert len(related_to_2) == 2  # Still connected to both 0 and 1
+    
+    def test_update_tracking_consistency(self, state_manager, sample_finding):
+        """Test that update timestamps are consistently maintained."""
+        state_manager.add_finding(sample_finding)
+        
+        original_updated_at = sample_finding.updated_at
+        
+        # Wait a small amount to ensure timestamp difference
+        import time
+        time.sleep(0.01)
+        
+        # Update finding
+        state_manager.update_finding(sample_finding.id, description="Updated description")
+        
+        updated_finding = state_manager.get_finding(sample_finding.id)
+        assert updated_finding.updated_at > original_updated_at
+        
+        # Verify created_at remains unchanged
+        assert updated_finding.created_at == sample_finding.created_at
