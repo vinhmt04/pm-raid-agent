@@ -37,6 +37,7 @@ def initialize_session_state() -> None:
         "raid_thread_config": None,
         "raid_workflow_state": None,
         "raid_review_decisions": {},
+        "raid_review_edits": {},
         "raid_export_result": None,
         "raid_current_page": "Upload",
         "raid_navigation": "Upload",
@@ -139,6 +140,7 @@ def render_upload_page() -> None:
         st.session_state.raid_workflow_state = None
         st.session_state.raid_thread_config = None
         st.session_state.raid_review_decisions = {}
+        st.session_state.raid_review_edits = {}
         st.session_state.raid_export_result = None
         with st.spinner("Extracting document content..."):
             documents, results = process_uploaded_documents(files)
@@ -164,9 +166,167 @@ def render_upload_page() -> None:
         st.caption("Start LangGraph analysis will be connected in Task 11.1.")
 
 
+def get_review_snapshot(workflow, thread_config):
+    """Read the actual checkpoint; never infer approval from UI state."""
+    snapshot = workflow.graph.get_state(thread_config)
+    if not snapshot or not snapshot.values:
+        return None, [], False
+    state = snapshot.values
+    manager = state.get("raid_state_manager")
+    findings = manager.get_all_findings() if manager is not None else []
+    interrupted = any(getattr(task, "interrupts", ()) for task in (snapshot.tasks or ()))
+    return state, findings, interrupted
+
+
+def validate_review_decisions(findings, decisions):
+    """Only explicit approve/reject choices for every pending item are accepted."""
+    pending = {f.id for f in findings if f.status.value == "pending"}
+    if set(decisions) != pending or any(
+        value not in ("approved", "rejected") for value in decisions.values()
+    ):
+        raise ValueError("Choose Approve or Reject for every pending RAID finding.")
+    return {finding_id: decisions[finding_id] for finding_id in pending}
+
+
+def apply_review_edits(manager, edits):
+    """Edit content without changing approval status or source citations."""
+    for finding_id, values in edits.items():
+        finding = manager.get_finding(finding_id)
+        if finding is None:
+            raise ValueError(f"Unknown RAID finding: {finding_id}")
+        if not isinstance(values, dict) or not set(values).issubset(
+            {"description", "recommendations"}
+        ):
+            raise ValueError("Only description and recommendations may be edited")
+        for field_name, value in values.items():
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{field_name} cannot be empty")
+            manager.update_finding(finding_id, **{field_name: value.strip()})
+    return manager
+
+
+def submit_review(workflow, session_id, decisions, edits):
+    """Resume first, then persist staged content edits in the completed checkpoint.
+
+    Updating the graph checkpoint *before* Command(resume) can replace the
+    interrupted task and lose its resume target.
+    """
+    config = {"configurable": {"thread_id": session_id}}
+    state, findings, interrupted = get_review_snapshot(workflow, config)
+    if not interrupted:
+        raise ValueError("Workflow is not waiting for PM review")
+    validated = validate_review_decisions(findings, decisions)
+    # Validate all edits before any approval is applied.
+    from copy import deepcopy
+    preview = deepcopy(state["raid_state_manager"])
+    apply_review_edits(preview, edits)
+    result = workflow.resume_workflow(session_id, validated)
+    completed = result["state"]
+    manager = completed["raid_state_manager"]
+    apply_review_edits(manager, edits)
+    if edits:
+        workflow.graph.update_state(config, {"raid_state_manager": manager})
+    return workflow.graph.get_state(config).values
+
+
 def render_review_page() -> None:
     st.header("Review RAID findings")
-    st.info("Finding review and approval controls will be connected in Task 9.3.")
+    if st.session_state.raid_workflow is None:
+        documents = st.session_state.raid_documents
+        if not documents:
+            st.info("Process project documents on the Upload page first.")
+            return
+        st.info("Start analysis to extract RAID findings before PM review.")
+        if st.button("Start RAID analysis", key="raid_start_analysis"):
+            try:
+                from src.workflow.langgraph_workflow import RAIDWorkflow
+            except ImportError as exc:
+                st.error(f"Workflow is unavailable: {exc}")
+                return
+            try:
+                workflow = RAIDWorkflow({})
+                session_id = st.session_state.raid_session_id
+                run = workflow.start_analysis(documents, session_id)
+                with st.spinner("Analyzing documents with LangGraph..."):
+                    workflow.graph.invoke(run["initial_state"], config=run["thread_config"])
+                st.session_state.raid_workflow = workflow
+                st.session_state.raid_thread_config = run["thread_config"]
+            except Exception as exc:
+                st.error(f"RAID analysis failed: {exc}")
+                return
+        else:
+            return
+
+    workflow = st.session_state.raid_workflow
+    config = st.session_state.raid_thread_config
+    if not config:
+        st.error("Workflow thread configuration is missing.")
+        return
+    try:
+        state, findings, interrupted = get_review_snapshot(workflow, config)
+    except Exception as exc:
+        st.error(f"Cannot load RAID review: {exc}")
+        return
+    if state is None:
+        st.warning("No workflow checkpoint found.")
+        return
+    st.session_state.raid_workflow_state = state
+    if state.get("workflow_status") == "error":
+        st.error("Analysis failed. Check workflow errors before reviewing.")
+        for message in state.get("error_messages", []):
+            st.caption(message)
+        return
+    if not findings:
+        st.info("No RAID findings were identified for review.")
+        return
+
+    pending = [f for f in findings if f.status.value == "pending"]
+    st.caption(f"{len(findings)} findings · {len(pending)} awaiting decision")
+    decisions = st.session_state.raid_review_decisions
+    edits = st.session_state.raid_review_edits
+    for finding in findings:
+        with st.expander(f"{finding.type.value.upper()} · {finding.description[:90]}", expanded=True):
+            st.write(f"Evidence: {finding.evidence_type.value} · Status: {finding.status.value}")
+            st.write(f"Impact: {finding.impact_assessment or 'Not assessed'}")
+            for citation in finding.source_citations:
+                st.caption(f"Source: {citation.filename} · {citation.location}")
+                st.write(citation.excerpt)
+            if finding.related_items:
+                st.caption("Related findings: " + ", ".join(finding.related_items))
+            description = st.text_area("Description", value=edits.get(finding.id, {}).get(
+                "description", finding.description), key=f"raid_desc_{finding.id}", disabled=not interrupted)
+            recommendations = st.text_area("Recommendations", value=edits.get(finding.id, {}).get(
+                "recommendations", finding.recommendations), key=f"raid_rec_{finding.id}", disabled=not interrupted)
+            changed = {}
+            if description != finding.description:
+                changed["description"] = description
+            if recommendations != finding.recommendations:
+                changed["recommendations"] = recommendations
+            if changed:
+                edits[finding.id] = changed
+            else:
+                edits.pop(finding.id, None)
+            if finding.status.value == "pending" and interrupted:
+                selection = st.radio("PM decision", ["Not decided", "Approve", "Reject"],
+                    index={"approved": 1, "rejected": 2}.get(decisions.get(finding.id), 0),
+                    key=f"raid_decision_{finding.id}", horizontal=True)
+                if selection == "Not decided":
+                    decisions.pop(finding.id, None)
+                else:
+                    decisions[finding.id] = "approved" if selection == "Approve" else "rejected"
+    if interrupted and pending:
+        st.caption("Editing does not approve a finding. All decisions must be explicit.")
+        if st.button("Submit PM decisions", key="raid_submit_review"):
+            try:
+                updated = submit_review(workflow, st.session_state.raid_session_id,
+                                        dict(decisions), dict(edits))
+                st.session_state.raid_workflow_state = updated
+                st.session_state.raid_review_edits = {}
+                st.success("PM decisions saved to workflow checkpoint.")
+            except Exception as exc:
+                st.error(f"Review not submitted: {exc}")
+    elif state.get("approval_complete"):
+        st.success("PM review completed. Approved findings are ready for export.")
 
 
 def render_export_page() -> None:
