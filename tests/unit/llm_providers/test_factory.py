@@ -6,6 +6,8 @@ from unittest.mock import Mock, patch
 from llm_providers.factory import LLMProviderFactory
 from llm_providers.base import LLMProviderType, LLMProviderError, RetryConfig
 from llm_providers.openai_provider import OpenAIProvider
+from llm_providers.gemini_provider import GeminiProvider
+from llm_providers.groq_provider import GroqProvider
 
 
 class TestLLMProviderFactory:
@@ -19,12 +21,16 @@ class TestLLMProviderFactory:
         """Test factory initialization with available providers."""
         assert LLMProviderType.OPENAI in self.factory._providers
         assert self.factory._providers[LLMProviderType.OPENAI] == OpenAIProvider
+        assert self.factory._providers[LLMProviderType.GEMINI] == GeminiProvider
+        assert self.factory._providers[LLMProviderType.GROQ] == GroqProvider
     
     def test_get_available_providers(self):
         """Test getting list of available providers."""
         providers = self.factory.get_available_providers()
         assert LLMProviderType.OPENAI in providers
-        assert len(providers) == 1  # Only OpenAI for MVP
+        assert LLMProviderType.GEMINI in providers
+        assert LLMProviderType.GROQ in providers
+        assert len(providers) == 3
     
     @patch('llm_providers.factory.config')
     def test_get_provider_from_config(self, mock_config):
@@ -154,3 +160,26 @@ class TestLLMProviderFactory:
                 self.factory.get_provider(LLMProviderType.OPENAI)
             
             assert "Failed to create LLM provider" in str(excinfo.value)
+
+class TestGeminiFactory:
+    def test_explicit_gemini_provider(self, monkeypatch):
+        monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+        provider = LLMProviderFactory().get_provider(LLMProviderType.GEMINI)
+        assert isinstance(provider, GeminiProvider)
+        assert provider.is_configured()
+
+    def test_gemini_selected_by_config(self, monkeypatch):
+        monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+        with patch("llm_providers.factory.config") as mock_config:
+            mock_config.app.llm_provider = "gemini"
+            provider = LLMProviderFactory().get_provider()
+            assert isinstance(provider, GeminiProvider)
+
+
+class TestGroqFactory:
+    @patch("llm_providers.factory.config")
+    def test_groq_selection(self, mock_config):
+        mock_config.app.llm_provider = "groq"
+        provider = LLMProviderFactory().get_provider()
+        assert isinstance(provider, GroqProvider)
+        assert provider.provider_type == LLMProviderType.GROQ

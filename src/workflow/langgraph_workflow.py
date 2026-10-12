@@ -7,6 +7,7 @@ from typing import List, Dict, Any, Optional, TypedDict, Annotated
 from dataclasses import dataclass, field
 from datetime import datetime
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -153,7 +154,15 @@ class RAIDWorkflow:
         workflow.add_edge("individual_analysis", "cross_document_synthesis")
         workflow.add_edge("cross_document_synthesis", "evidence_classification")
         workflow.add_edge("evidence_classification", "review_management")
-        workflow.add_edge("review_management", END)
+        # Route through a separate node to start a fresh interrupt task on
+        # the next review round (rather than self-looping an interrupted node).
+        workflow.add_node("review_round_boundary", lambda state: {})
+        workflow.add_conditional_edges(
+            "review_management",
+            lambda state: "again" if state["pending_review_findings"] else "done",
+            {"again": "review_round_boundary", "done": END},
+        )
+        workflow.add_edge("review_round_boundary", "review_management")
         
         # Compile graph with checkpointer
         return workflow.compile(checkpointer=self.checkpointer)
@@ -204,11 +213,7 @@ class RAIDWorkflow:
         }
     
     def resume_workflow(self, session_id: str, review_decisions: Dict[str, str]) -> Dict[str, Any]:
-        """Resume an interrupted graph with explicit PM decisions.
-
-        Every pending finding needs an explicit decision. Invalid or partial
-        submissions are rejected before resuming the graph.
-        """
+        """Resume an interrupted graph with decisions for a subset of pending findings."""
         thread_config = {"configurable": {"thread_id": session_id}}
         snapshot = self.graph.get_state(thread_config)
         if not snapshot or not snapshot.values or not snapshot.tasks or not any(
@@ -219,11 +224,11 @@ class RAIDWorkflow:
             raise ValueError("Review decisions must be a dictionary")
         manager = snapshot.values["raid_state_manager"]
         pending = {finding.id for finding in manager.get_pending_findings()}
-        if set(review_decisions) != pending or any(
+        if (not review_decisions or not set(review_decisions).issubset(pending) or any(
             not isinstance(decision, str) or decision.lower() not in {"approved", "rejected"}
             for decision in review_decisions.values()
-        ):
-            raise ValueError("Every pending finding requires an explicit approve/reject decision")
+        )):
+            raise ValueError("Submit valid decisions for at least one pending finding")
         result = self.graph.invoke(Command(resume=review_decisions), config=thread_config)
         return {"thread_config": thread_config, "result": result,
                 "state": self.graph.get_state(thread_config).values}
@@ -420,11 +425,12 @@ class RAIDWorkflow:
             "findings": [finding.to_dict() for finding in pending],
             "pending_review_findings": pending_ids,
         })
-        if not isinstance(decisions, dict) or set(decisions) != set(pending_ids) or any(
-            not isinstance(decision, str) or decision.lower() not in {"approved", "rejected"}
-            for decision in decisions.values()
-        ):
-            raise ValueError("Every pending finding requires an explicit decision")
+        if (not isinstance(decisions, dict) or not decisions
+                or not set(decisions).issubset(set(pending_ids)) or any(
+                    not isinstance(decision, str) or decision.lower() not in {"approved", "rejected"}
+                    for decision in decisions.values()
+                )):
+            raise ValueError("Submit valid decisions for at least one pending finding")
 
         for finding_id, decision in decisions.items():
             finding = manager.get_finding(finding_id)
@@ -433,9 +439,15 @@ class RAIDWorkflow:
             else:
                 finding.reject()
 
-        return {"raid_state_manager": manager, "review_decisions": decisions, "pending_review_findings": [],
-                "approval_complete": True, "workflow_status": "completed",
-                "current_phase": "completed", "last_updated_at": datetime.now()}
+        remaining = [finding.id for finding in manager.get_pending_findings()]
+        complete = not remaining
+        return {"raid_state_manager": manager,
+                "review_decisions": {**state.get("review_decisions", {}), **decisions},
+                "pending_review_findings": remaining,
+                "approval_complete": complete,
+                "workflow_status": "completed" if complete else "awaiting_review",
+                "current_phase": "completed" if complete else "review",
+                "last_updated_at": datetime.now()}
 
     # Helper Methods for LLM Integration
     
@@ -573,6 +585,8 @@ class RAIDWorkflow:
             provider = llm_factory.get_provider()
             if not provider.is_configured():
                 return fallback("LLM unavailable; retaining individual findings")
+            if type(provider).__name__ == "GroqProvider" and os.getenv("RAID_GROQ_SYNTHESIS", "0") != "1":
+                return fallback("Groq demo mode: cross-document synthesis skipped")
 
             indexed = [
                 {"index": i, "type": f.type.value, "description": f.description,
@@ -732,6 +746,10 @@ class RAIDWorkflow:
                 return {}
         except Exception as exc:
             logger.warning("Evidence classification skipped: provider unavailable", error=str(exc))
+            return {}
+
+        if type(provider).__name__ == "GroqProvider":
+            logger.info("Groq reclassification skipped; retaining original evidence types")
             return {}
 
         classifications: Dict[str, str] = {}

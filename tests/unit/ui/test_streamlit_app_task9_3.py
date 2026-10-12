@@ -16,10 +16,9 @@ def finding():
                        source_citations=[SourceCitation("plan.pdf", "Page 2", "Late vendor delivery")])
 
 
-def test_decisions_require_all_findings_and_valid_labels():
+def test_partial_decisions_and_valid_labels():
     a, b = finding(), finding()
-    with pytest.raises(ValueError, match="every pending"):
-        validate_review_decisions([a, b], {a.id: "approved"})
+    assert validate_review_decisions([a, b], {a.id: "approved"}) == {a.id: "approved"}
     with pytest.raises(ValueError):
         validate_review_decisions([a], {a.id: "pending"})
     assert validate_review_decisions([a], {a.id: "rejected"}) == {a.id: "rejected"}

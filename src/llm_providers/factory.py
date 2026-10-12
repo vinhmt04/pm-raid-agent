@@ -6,6 +6,8 @@ Provides unified interface for creating and managing LLM providers.
 from typing import Optional, Dict, Type
 from llm_providers.base import LLMProvider, LLMProviderType, LLMProviderError, LLMProviderWithRetry, RetryConfig
 from llm_providers.openai_provider import OpenAIProvider
+from llm_providers.gemini_provider import GeminiProvider
+from llm_providers.groq_provider import GroqProvider
 from config import config
 from logging_config import get_logger
 
@@ -21,7 +23,9 @@ class LLMProviderFactory:
     def __init__(self):
         """Initialize factory with available providers."""
         self._providers: Dict[LLMProviderType, Type[LLMProvider]] = {
-            LLMProviderType.OPENAI: OpenAIProvider
+            LLMProviderType.OPENAI: OpenAIProvider,
+            LLMProviderType.GEMINI: GeminiProvider,
+            LLMProviderType.GROQ: GroqProvider
         }
         
         logger.debug("LLM provider factory initialized", 
@@ -47,7 +51,9 @@ class LLMProviderFactory:
                 
                 # Map string to enum
                 provider_mapping = {
-                    "openai": LLMProviderType.OPENAI
+                    "openai": LLMProviderType.OPENAI,
+                    "gemini": LLMProviderType.GEMINI,
+                    "groq": LLMProviderType.GROQ
                 }
                 
                 if configured_provider not in provider_mapping:

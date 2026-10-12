@@ -1,4 +1,4 @@
-﻿"""Unit tests for configuration management."""
+"""Unit tests for configuration management."""
 
 import os
 import pytest
@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 
-from config import Config, ApplicationConfig, OpenAIProviderConfig
+from config import Config, ApplicationConfig, OpenAIProviderConfig, GroqProviderConfig
 
 
 class TestApplicationConfig:
@@ -71,12 +71,13 @@ class TestConfig:
     def test_lazy_initialization_without_api_key(self):
         """Test that Config can be created without API key."""
         # This should not raise an error during initialization
-        config = Config()
-        assert config.app.llm_provider == "openai"
+        with patch.dict(os.environ, {"LLM_PROVIDER": "openai", "OPENAI_API_KEY": ""}):
+            config = Config()
+            assert config.app.llm_provider == "openai"
     
     def test_llm_provider_lazy_loading(self):
         """Test that LLM provider config is loaded lazily."""
-        with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-test123"}):
+        with patch.dict(os.environ, {"LLM_PROVIDER": "openai", "OPENAI_API_KEY": "sk-test123"}):
             config = Config()
             # Should not have initialized LLM config yet
             assert config._llm_config is None
@@ -88,13 +89,50 @@ class TestConfig:
     
     def test_validation_with_invalid_credentials(self):
         """Test validation fails with invalid credentials."""
-        with patch.dict(os.environ, {"OPENAI_API_KEY": ""}, clear=False):
+        with patch.dict(os.environ, {"LLM_PROVIDER": "openai", "OPENAI_API_KEY": ""}, clear=False):
             config = Config()
             with pytest.raises(ValueError, match="Invalid credentials"):
                 config.validate_configuration()
     
     def test_validation_with_valid_credentials(self):
         """Test validation passes with valid credentials."""
-        with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-test123"}, clear=False):
+        with patch.dict(os.environ, {"LLM_PROVIDER": "openai", "OPENAI_API_KEY": "sk-test123"}, clear=False):
             config = Config()
             assert config.validate_configuration() is True
+
+
+class TestGeminiConfiguration:
+    def test_gemini_lazy_loading(self):
+        with patch.dict(os.environ, {"LLM_PROVIDER": "gemini", "GEMINI_API_KEY": "test-gemini-key"}):
+            instance = Config()
+            assert instance._llm_config is None
+            provider = instance.get_llm_provider_config()
+            assert provider.provider_name == "gemini"
+            assert provider.validate_credentials() is True
+
+    def test_gemini_invalid_credentials(self):
+        with patch.dict(os.environ, {"LLM_PROVIDER": "gemini", "GEMINI_API_KEY": ""}):
+            with pytest.raises(ValueError, match="Invalid credentials"):
+                Config().validate_configuration()
+
+
+class TestGroqConfiguration:
+    def test_valid_and_invalid_credentials(self):
+        assert GroqProviderConfig(api_key="gsk-test-only").validate_credentials() is True
+        assert GroqProviderConfig(api_key="").validate_credentials() is False
+        with pytest.raises(ValueError, match="Invalid or missing Groq API key"):
+            GroqProviderConfig(api_key="").get_connection_params()
+
+    def test_lazy_loading_and_validation(self):
+        with patch.dict(os.environ, {"LLM_PROVIDER": "groq", "GROQ_API_KEY": "gsk-test-only", "GROQ_MODEL": "openai/gpt-oss-120b"}):
+            instance = Config()
+            assert instance._llm_config is None
+            provider = instance.get_llm_provider_config()
+            assert provider.provider_name == "groq"
+            assert provider.model == "openai/gpt-oss-120b"
+            assert instance.validate_configuration() is True
+
+    def test_missing_credentials(self):
+        with patch.dict(os.environ, {"LLM_PROVIDER": "groq", "GROQ_API_KEY": ""}):
+            with pytest.raises(ValueError, match="Invalid credentials"):
+                Config().validate_configuration()

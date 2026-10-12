@@ -17,6 +17,8 @@ logger = get_logger(__name__)
 class LLMProviderType(Enum):
     """Supported LLM provider types."""
     OPENAI = "openai"
+    GEMINI = "gemini"
+    GROQ = "groq"
 
 
 @dataclass

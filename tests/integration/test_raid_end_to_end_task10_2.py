@@ -52,9 +52,8 @@ class ScriptedProvider:
 
     def generate_response(self, request):
         prompt = request.system_prompt
-        user_messages = [message for message in request.messages
-                         if message.get("role") == "user"]
-        assert user_messages, "Expected a user message in LLM request"
+        user_messages = [m for m in request.messages if m.get("role") == "user"]
+        assert user_messages, "Missing user message"
         user_content = user_messages[-1]["content"]
         if "indexed findings" in prompt:
             self.synthesis_requests += 1
@@ -78,7 +77,8 @@ class ScriptedProvider:
             return SimpleNamespace(content=json.dumps({"evidence_type": "fact", "reasoning": "Cited source"}))
         if "RAID analyst" in prompt:
             self.section_requests += 1
-            source = user_content.split("Source text:\n", 1)[1]
+            assert "Source text:\n" in user_content, "Expected source text in user message"
+            source = user_content.partition("Source text:\n")[2]
             excerpt = next((line.strip() for line in source.splitlines() if len(line.strip()) >= 15), source.strip()[:80])
             assert excerpt and excerpt in source
             return SimpleNamespace(content=json.dumps({"findings": [{
@@ -113,29 +113,6 @@ def analyzed(documents):
             documents, "e2e-task10-2", session, RAIDWorkflow
         )
     assert interrupted is True
-    if len(findings) < 3:
-        state = session["raid_workflow"].graph.get_state(session["raid_thread_config"]).values
-        analyses = state.get("individual_analyses", [])
-        details = {
-            "provider_requests": {
-                "sections": provider.section_requests,
-                "synthesis": provider.synthesis_requests,
-                "classification": provider.classification_requests,
-            },
-            "individual_analyses": [
-                {
-                    "document": a.document_metadata.filename,
-                    "candidates": len(a.potential_findings),
-                    "errors": a.processing_errors,
-                    "summary": a.analysis_summary,
-                }
-                for a in analyses
-            ],
-            "synthesis": repr(state.get("cross_document_synthesis")),
-            "workflow_errors": state.get("error_messages", []),
-            "status": state.get("workflow_status"),
-        }
-        pytest.fail("Expected at least 3 findings; diagnostics: " + repr(details))
     assert len(findings) >= 3
     return session, provider, findings
 
@@ -155,7 +132,7 @@ def test_complete_workflow_and_export_only_approved(analyzed):
     assert any(len(f.source_citations) > 0 for f in findings)
     assert {c.filename for f in findings for c in f.source_citations} == set(SAMPLE_NAMES)
 
-    with pytest.raises(ValueError, match="approval"):
+    with pytest.raises(ValueError, match="approved|approval"):
         prepare_approved_export(workflow, config)
 
     decisions = {finding.id: ("approved" if i == 0 else "rejected")
@@ -180,14 +157,22 @@ def test_complete_workflow_and_export_only_approved(analyzed):
     wb.close()
 
 
-def test_partial_pm_decisions_do_not_resume(analyzed):
+def test_partial_pm_decisions_allow_export_and_continue(analyzed):
     session, _, findings = analyzed
     workflow = session["raid_workflow"]
     config = session["raid_thread_config"]
-    with pytest.raises(ValueError, match="every pending RAID finding"):
-        submit_review(workflow, "e2e-task10-2", {findings[0].id: "approved"}, {})
-    _, _, interrupted = get_review_snapshot(workflow, config)
+    updated = submit_review(workflow, "e2e-task10-2", {findings[0].id: "approved"}, {})
+    assert updated["approval_complete"] is False
+    _, current, interrupted = get_review_snapshot(workflow, config)
     assert interrupted
+    assert len([f for f in current if f.status.value == "approved"]) == 1
+    assert len([f for f in current if f.status.value == "pending"]) == len(findings) - 1
+    download = prepare_approved_export(workflow, config)
+    assert download.approved_count == 1
+    submit_review(workflow, "e2e-task10-2", {f.id: "rejected" for f in current if f.status.value == "pending"}, {})
+    final, _, interrupted = get_review_snapshot(workflow, config)
+    assert not interrupted
+    assert final["approval_complete"] is True
 
 
 def test_all_rejected_cannot_export(analyzed):

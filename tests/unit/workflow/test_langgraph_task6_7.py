@@ -13,7 +13,13 @@ def setup_review(count=2):
     graph = StateGraph(WorkflowState)
     graph.add_node("review_management", workflow.manage_review_approval)
     graph.set_entry_point("review_management")
-    graph.add_edge("review_management", END)
+    graph.add_node("review_round_boundary", lambda state: {})
+    graph.add_conditional_edges(
+        "review_management",
+        lambda state: "done" if state["approval_complete"] else "review_again",
+        {"done": END, "review_again": "review_round_boundary"},
+    )
+    graph.add_edge("review_round_boundary", "review_management")
     workflow.graph = graph.compile(checkpointer=workflow.checkpointer)
     manager = RAIDStateManager()
     findings = []
@@ -61,12 +67,19 @@ def test_invalid_decisions_do_not_resume(decisions):
     assert workflow.graph.get_state(config).next == ("review_management",)
 
 
-def test_partial_review_rejected():
+def test_partial_review_can_resume_again():
     workflow, config, state, findings = setup_review()
     workflow.graph.invoke(state, config=config)
-    with pytest.raises(ValueError):
-        workflow.resume_workflow(state["session_id"], {findings[0].id: "approved"})
-    assert all(f.status == Status.PENDING for f in findings)
+    first = workflow.resume_workflow(state["session_id"], {findings[0].id: "approved"})
+    assert first["state"]["approval_complete"] is False
+    assert first["state"]["workflow_status"] == "awaiting_review"
+    assert first["state"]["raid_state_manager"].get_finding(findings[0].id).status == Status.APPROVED
+    assert first["state"]["raid_state_manager"].get_finding(findings[1].id).status == Status.PENDING
+    assert any(t.interrupts for t in workflow.graph.get_state(config).tasks)
+    second = workflow.resume_workflow(state["session_id"], {findings[1].id: "rejected"})
+    assert second["state"]["approval_complete"] is True
+    assert second["state"]["workflow_status"] == "completed"
+    assert second["state"]["raid_state_manager"].get_finding(findings[1].id).status == Status.REJECTED
 
 
 def test_no_findings_finishes_without_interrupt():

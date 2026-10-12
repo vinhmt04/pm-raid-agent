@@ -44,7 +44,6 @@ def test_export_contains_only_approved_findings():
 
 @pytest.mark.parametrize("approved,interrupted,status", [
     (False, False, "completed"),
-    (True, True, "completed"),
     (True, False, "error"),
 ])
 def test_export_blocked_without_completed_approval(approved, interrupted, status):
@@ -82,3 +81,13 @@ def test_export_service_error_propagates():
     service.prepare_download.side_effect = RuntimeError("disk error")
     with pytest.raises(RuntimeError, match="disk error"):
         prepare_approved_export(checkpoint(manager), CONFIG, service=service)
+
+
+def test_export_during_partial_review_includes_approved():
+    manager = RAIDStateManager()
+    approved, pending = make_finding(), make_finding()
+    approved.approve()
+    manager.add_finding(approved)
+    manager.add_finding(pending)
+    result = prepare_approved_export(checkpoint(manager, approved=False, interrupted=True, status="awaiting_review"), CONFIG)
+    assert result.approved_count == 1

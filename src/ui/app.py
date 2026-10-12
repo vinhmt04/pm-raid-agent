@@ -239,13 +239,15 @@ def get_review_snapshot(workflow, thread_config):
 
 
 def validate_review_decisions(findings, decisions):
-    """Only explicit approve/reject choices for every pending item are accepted."""
+    """Accept explicit decisions for any subset of currently pending findings."""
     pending = {f.id for f in findings if f.status.value == "pending"}
-    if set(decisions) != pending or any(
+    if not decisions:
+        raise ValueError("Choose Approve or Reject for at least one pending RAID finding.")
+    if not set(decisions).issubset(pending) or any(
         value not in ("approved", "rejected") for value in decisions.values()
     ):
-        raise ValueError("Choose Approve or Reject for every pending RAID finding.")
-    return {finding_id: decisions[finding_id] for finding_id in pending}
+        raise ValueError("Decisions must refer to pending findings and be Approve or Reject.")
+    return dict(decisions)
 
 
 def apply_review_edits(manager, edits):
@@ -369,14 +371,17 @@ def render_review_page() -> None:
                 else:
                     decisions[finding.id] = "approved" if selection == "Approve" else "rejected"
     if interrupted and pending:
-        st.caption("Editing does not approve a finding. All decisions must be explicit.")
+        st.caption("Editing does not approve a finding. You may submit some decisions and leave others Pending.")
         if st.button("Submit PM decisions", key="raid_submit_review"):
             try:
                 updated = submit_review(workflow, st.session_state.raid_session_id,
                                         dict(decisions), dict(edits))
                 st.session_state.raid_workflow_state = updated
                 st.session_state.raid_review_edits = {}
-                st.success("PM decisions saved to workflow checkpoint.")
+                st.session_state.raid_review_decisions = {}
+                st.session_state.raid_export_result = None
+                st.success("PM decisions saved. Remaining findings stay Pending.")
+                st.rerun()
             except Exception as exc:
                 st.error(f"Review not submitted: {exc}")
     elif state.get("approval_complete"):
@@ -392,8 +397,8 @@ def prepare_approved_export(workflow, thread_config, service=None):
     state, findings, interrupted = get_review_snapshot(workflow, thread_config)
     if state is None:
         raise ValueError("No workflow checkpoint is available for export.")
-    if interrupted or not state.get("approval_complete", False):
-        raise ValueError("Complete PM approval before exporting RAID findings.")
+    if not state.get("approval_complete", False) and not interrupted:
+        raise ValueError("No active PM review checkpoint is available for export.")
     if state.get("workflow_status") == "error":
         raise ValueError("Cannot export a failed RAID workflow.")
     manager = state.get("raid_state_manager")
@@ -420,9 +425,11 @@ def render_export_page() -> None:
         return
     approved = [finding for finding in findings if finding.status.value == "approved"]
     st.write(f"Approved findings: {len(approved)} / {len(findings)}")
-    if interrupted or not state.get("approval_complete", False):
-        st.warning("Finish PM review and approval before exporting.")
+    if not state.get("approval_complete", False) and not interrupted:
+        st.warning("No active PM review checkpoint is available for export.")
         return
+    if interrupted:
+        st.info("Review is still in progress. Export includes Approved findings only; Pending items are excluded.")
     if state.get("workflow_status") == "error":
         st.error("Workflow failed. Excel export is unavailable.")
         return

@@ -34,8 +34,10 @@ class TestOpenAIProvider:
     
     def test_is_configured_invalid_key(self):
         """Test is_configured with invalid API key."""
-        provider = OpenAIProvider(api_key="", model=self.model)
-        assert provider.is_configured() is False
+        with patch("llm_providers.openai_provider.config") as mock_config:
+            mock_config.get_llm_provider_config.side_effect = ValueError("No credentials")
+            provider = OpenAIProvider(api_key="", model=self.model)
+            assert provider.is_configured() is False
         
         provider = OpenAIProvider(api_key="your_openai_api_key_here", model=self.model)
         assert provider.is_configured() is False
@@ -177,7 +179,9 @@ class TestOpenAIProvider:
     
     def test_generate_without_configuration(self):
         """Test generation without proper configuration."""
-        provider = OpenAIProvider(api_key="", model=self.model)
+        with patch("llm_providers.openai_provider.config") as mock_config:
+            mock_config.get_llm_provider_config.side_effect = ValueError("No credentials")
+            provider = OpenAIProvider(api_key="", model=self.model)
         request = LLMRequest(messages=[{"role": "user", "content": "Hello"}])
         
         with pytest.raises(LLMAuthenticationError) as excinfo:
@@ -234,7 +238,9 @@ class TestOpenAIProvider:
     
     def test_test_connection_not_configured(self):
         """Test connection test with invalid configuration."""
-        provider = OpenAIProvider(api_key="", model=self.model)
+        with patch("llm_providers.openai_provider.config") as mock_config:
+            mock_config.get_llm_provider_config.side_effect = ValueError("No credentials")
+            provider = OpenAIProvider(api_key="", model=self.model)
         assert provider.test_connection() is False
     
     @patch('llm_providers.openai_provider.OpenAI')

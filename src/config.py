@@ -1,4 +1,4 @@
-﻿"""
+"""
 Configuration management for PM RAID Agent MVP.
 Implements loosely coupled LLM provider configuration with lazy initialization.
 """
@@ -60,6 +60,36 @@ class OpenAIProviderConfig(LLMProviderConfig):
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
         }
+
+
+class GeminiProviderConfig(LLMProviderConfig):
+    provider_name: str = 'gemini'
+    api_key: str = ''
+    model: str = 'gemini-2.5-flash'
+
+    def validate_credentials(self) -> bool:
+        return bool(self.api_key.strip() and self.api_key not in {'your_gemini_api_key', 'replace_with_your_gemini_api_key'})
+
+    def get_connection_params(self) -> Dict[str, Any]:
+        if not self.validate_credentials():
+            raise ValueError('Invalid or missing Gemini API key')
+        return {'api_key': self.api_key, 'model': self.model}
+
+
+class GroqProviderConfig(LLMProviderConfig):
+    """Groq Cloud free-tier provider settings."""
+    provider_name: str = "groq"
+    api_key: str = ""
+    model: str = "openai/gpt-oss-120b"
+
+    def validate_credentials(self) -> bool:
+        key = self.api_key.strip()
+        return bool(key and key not in {"your_groq_api_key", "gsk_xxxxxxxxxxxxxxxxx", "replace_with_your_groq_api_key"})
+
+    def get_connection_params(self) -> Dict[str, Any]:
+        if not self.validate_credentials():
+            raise ValueError("Invalid or missing Groq API key")
+        return {"api_key": self.api_key, "model": self.model}
 
 
 class ApplicationConfig(BaseModel):
@@ -132,8 +162,18 @@ class Config:
                 max_tokens=int(os.getenv("OPENAI_MAX_TOKENS", "4000")),
                 temperature=float(os.getenv("OPENAI_TEMPERATURE", "0.1")),
             )
+        elif provider == "gemini":
+            self._llm_config = GeminiProviderConfig(
+                api_key=os.getenv("GEMINI_API_KEY", ""),
+                model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+            )
+        elif provider == "groq":
+            self._llm_config = GroqProviderConfig(
+                api_key=os.getenv("GROQ_API_KEY", ""),
+                model=os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"),
+            )
         else:
-            supported_providers = ["openai"]
+            supported_providers = ["openai", "gemini", "groq"]
             raise ValueError(
                 f"Unsupported LLM provider: {provider}. "
                 f"Supported providers: {supported_providers}"
