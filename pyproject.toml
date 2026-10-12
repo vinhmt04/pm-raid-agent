@@ -76,6 +76,7 @@ python_files = ["test_*.py", "*_test.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = [
+    "--import-mode=importlib",
     "--strict-markers",
     "--strict-config",
     "--verbose",
