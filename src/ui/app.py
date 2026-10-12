@@ -110,6 +110,49 @@ def process_uploaded_documents(files, factory=None):
     return documents, results
 
 
+def start_raid_analysis(documents, session_id, workflow_factory=None):
+    """Run the real LangGraph graph and return its persisted checkpoint.
+
+    A failed run is never stored in Streamlit session state as successful.
+    """
+    if not documents:
+        raise ValueError("Process at least one document before starting RAID analysis.")
+    if workflow_factory is None:
+        from src.workflow.langgraph_workflow import RAIDWorkflow
+        workflow_factory = RAIDWorkflow
+    workflow = workflow_factory({})
+    run = workflow.start_analysis(documents, session_id)
+    config = run["thread_config"]
+    workflow.graph.invoke(run["initial_state"], config=config)
+    state, findings, interrupted = get_review_snapshot(workflow, config)
+    if state is None:
+        raise RuntimeError("LangGraph did not persist an analysis checkpoint.")
+    if state.get("workflow_status") == "error":
+        raise RuntimeError("; ".join(state.get("error_messages", [])) or "Analysis failed.")
+    # The analysis node catches individual provider errors; do not silently
+    # present a successful empty result if every document analysis failed.
+    analyses = state.get("individual_analyses", [])
+    if analyses and all(getattr(a, "processing_errors", None) for a in analyses):
+        raise RuntimeError("All document analyses failed: " + "; ".join(
+            str(error) for analysis in analyses for error in analysis.processing_errors
+        ))
+    return workflow, config, state, findings, interrupted
+
+
+def run_analysis_in_session(documents, session_id, session_state, workflow_factory=None):
+    """Persist only a successful analysis; keep review/export in sync."""
+    workflow, config, state, findings, interrupted = start_raid_analysis(
+        documents, session_id, workflow_factory
+    )
+    session_state["raid_workflow"] = workflow
+    session_state["raid_thread_config"] = config
+    session_state["raid_workflow_state"] = state
+    session_state["raid_review_decisions"] = {}
+    session_state["raid_review_edits"] = {}
+    session_state["raid_export_result"] = None
+    return findings, interrupted
+
+
 def render_upload_page() -> None:
     st.header("Upload project documents")
     files = st.file_uploader(
@@ -163,7 +206,24 @@ def render_upload_page() -> None:
             if result.error:
                 st.caption(result.error)
         st.info(f"{len(st.session_state.raid_documents)} document(s) ready for RAID analysis.")
-        st.caption("Start LangGraph analysis will be connected in Task 11.1.")
+        if st.session_state.raid_workflow is None:
+            if st.button("Start RAID analysis", key="raid_start_analysis_upload"):
+                try:
+                    with st.spinner("Analyzing documents with LangGraph..."):
+                        findings, interrupted = run_analysis_in_session(
+                            st.session_state.raid_documents,
+                            st.session_state.raid_session_id,
+                            st.session_state,
+                        )
+                    st.success(f"Analysis completed: {len(findings)} RAID findings.")
+                    if interrupted:
+                        st.info("Open Review to approve or reject findings.")
+                    elif not findings:
+                        st.info("No supported RAID findings identified.")
+                except Exception as exc:
+                    st.error(f"RAID analysis failed: {exc}")
+        else:
+            st.info("Analysis is available on the Review page.")
 
 
 def get_review_snapshot(workflow, thread_config):
@@ -239,18 +299,12 @@ def render_review_page() -> None:
         st.info("Start analysis to extract RAID findings before PM review.")
         if st.button("Start RAID analysis", key="raid_start_analysis"):
             try:
-                from src.workflow.langgraph_workflow import RAIDWorkflow
-            except ImportError as exc:
-                st.error(f"Workflow is unavailable: {exc}")
-                return
-            try:
-                workflow = RAIDWorkflow({})
-                session_id = st.session_state.raid_session_id
-                run = workflow.start_analysis(documents, session_id)
                 with st.spinner("Analyzing documents with LangGraph..."):
-                    workflow.graph.invoke(run["initial_state"], config=run["thread_config"])
-                st.session_state.raid_workflow = workflow
-                st.session_state.raid_thread_config = run["thread_config"]
+                    run_analysis_in_session(
+                        documents,
+                        st.session_state.raid_session_id,
+                        st.session_state,
+                    )
             except Exception as exc:
                 st.error(f"RAID analysis failed: {exc}")
                 return
