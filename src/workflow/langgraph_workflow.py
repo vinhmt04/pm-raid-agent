@@ -6,6 +6,7 @@ Manages the multi-phase RAID analysis pipeline through discrete workflow nodes.
 from typing import List, Dict, Any, Optional, TypedDict, Annotated
 from dataclasses import dataclass, field
 from datetime import datetime
+import json
 import sys
 from pathlib import Path
 
@@ -29,6 +30,15 @@ except ImportError:
     from logging_config import get_logger
 
 logger = get_logger(__name__)
+# LLM provider imports
+try:
+    from src.llm_providers.factory import llm_factory
+    from src.llm_providers.base import LLMRequest, LLMProviderError
+except ImportError:
+    from llm_providers.factory import llm_factory
+    from llm_providers.base import LLMRequest, LLMProviderError
+
+
 
 
 @dataclass
@@ -239,7 +249,6 @@ class RAIDWorkflow:
         for document in state["documents"]:
             try:
                 # Analyze individual document
-                # This would integrate with LLM provider for actual analysis
                 analysis_result = self._analyze_single_document(document, state)
                 analyses.append(analysis_result)
                 
@@ -462,46 +471,98 @@ class RAIDWorkflow:
     
     # Helper Methods for LLM Integration (Stubs for now)
     
-    def _analyze_single_document(self, 
-                                document: DocumentMetadata, 
-                                state: WorkflowState) -> DocumentAnalysisResult:
-        """
-        Analyze individual document for RAID items.
-        
-        This is a stub implementation. In the actual system, this would:
-        1. Use the configured LLM provider to analyze document content
-        2. Extract potential RAID items with evidence
-        3. Tag findings with source metadata
-        
-        Args:
-            document: Document metadata to analyze
-            state: Current workflow state
-            
-        Returns:
-            Analysis result with potential findings
-        """
-        # Stub implementation - would integrate with actual LLM provider
-        potential_findings = [
-            {
-                "type": "risk",
-                "description": f"Potential risk identified in {document.filename}",
-                "evidence_type": "inference",
-                "source_citations": [{
-                    "filename": document.filename,
-                    "location": "Section 1",
-                    "excerpt": "Sample text excerpt"
-                }],
-                "impact_assessment": "",
-                "recommendations": ""
-            }
-        ]
-        
+    def _analyze_single_document(self,
+                                 document: DocumentMetadata,
+                                 state: WorkflowState) -> DocumentAnalysisResult:
+        """Extract source-grounded RAID candidates from each document section."""
+        findings: List[Dict[str, Any]] = []
+        errors: List[str] = []
+        sections = [section for section in document.content_sections
+                    if isinstance(section.text, str) and section.text.strip()]
+        if not sections:
+            return DocumentAnalysisResult(document, [], "No extractable text to analyze")
+
+        try:
+            provider = llm_factory.get_provider()
+            if not provider.is_configured():
+                raise LLMProviderError("LLM provider is not configured")
+        except Exception as exc:
+            message = f"LLM provider initialization failed: {exc}"
+            return DocumentAnalysisResult(document, [], message, [message])
+
+        for section in sections:
+            location = str(section.location)
+            content = section.text.strip()
+            request = LLMRequest(
+                system_prompt=(
+                    "You are a project management RAID analyst. Analyze ONLY the "
+                    "provided source text. Return a JSON object with a 'findings' "
+                    "array. Each finding must have: type (risk, assumption, issue, "
+                    "dependency), description, evidence_type (fact, inference, "
+                    "uncertainty), excerpt (an EXACT contiguous substring of the "
+                    "source), impact_assessment, recommendations. Do not invent "
+                    "facts or citations. Return an empty array if no RAID items "
+                    "are supported. Output JSON only, without markdown fences."
+                ),
+                messages=[{"role": "user", "content": (
+                    f"Document: {document.filename}\n"
+                    f"Location: {location}\nSource text:\n{content}"
+                )}],
+                temperature=0,
+            )
+            try:
+                response = provider.generate_response(request)
+                raw = response.content.strip()
+                # Some providers wrap JSON in a markdown code fence.
+                if raw.startswith("```"):
+                    lines = raw.splitlines()
+                    if len(lines) >= 3 and lines[-1].strip() == "```":
+                        raw = "\n".join(lines[1:-1])
+                payload = json.loads(raw)
+                items = payload.get("findings") if isinstance(payload, dict) else None
+                if not isinstance(items, list):
+                    raise ValueError("Expected a JSON object containing a findings array")
+
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    raid_type = str(item.get("type", "")).lower().strip()
+                    evidence_type = str(item.get("evidence_type", "")).lower().strip()
+                    description = item.get("description")
+                    excerpt = item.get("excerpt")
+                    if (raid_type not in {"risk", "assumption", "issue", "dependency"}
+                            or evidence_type not in {"fact", "inference", "uncertainty"}
+                            or not isinstance(description, str) or not description.strip()
+                            or not isinstance(excerpt, str) or not excerpt.strip()
+                            or excerpt.strip() not in content):
+                        errors.append(f"Discarded invalid or ungrounded finding at {location}")
+                        continue
+                    findings.append({
+                        "type": raid_type,
+                        "description": description.strip(),
+                        "evidence_type": evidence_type,
+                        "source_citations": [{
+                            "filename": document.filename,
+                            "location": location,
+                            "excerpt": excerpt.strip(),
+                        }],
+                        "impact_assessment": str(item.get("impact_assessment") or ""),
+                        "recommendations": str(item.get("recommendations") or ""),
+                    })
+            except Exception as exc:
+                message = f"Failed analyzing {document.filename} at {location}: {exc}"
+                logger.error("Document section analysis failed", filename=document.filename,
+                             location=location, error=str(exc))
+                errors.append(message)
+
         return DocumentAnalysisResult(
             document_metadata=document,
-            potential_findings=potential_findings,
-            analysis_summary=f"Analyzed {document.filename}: {len(potential_findings)} potential findings"
+            potential_findings=findings,
+            analysis_summary=(f"Analyzed {document.filename}: {len(findings)} RAID "
+                              f"candidates from {len(sections)} sections"),
+            processing_errors=errors,
         )
-    
+
     def _perform_cross_document_synthesis(self, state: WorkflowState) -> CrossDocumentSynthesis:
         """
         Perform cross-document synthesis of findings.

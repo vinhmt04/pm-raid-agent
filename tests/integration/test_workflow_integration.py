@@ -4,6 +4,10 @@ Tests end-to-end workflow integration and compatibility.
 """
 
 import pytest
+import json
+from unittest.mock import patch, MagicMock
+
+from src.llm_providers.base import LLMResponse
 from datetime import datetime
 from typing import List
 
@@ -172,9 +176,39 @@ class TestWorkflowIntegration:
         result = workflow.start_analysis(sample_document_metadata, session_id)
         state = result["initial_state"]
         
-        # Run individual analysis
-        individual_updates = workflow.analyze_individual_documents(state)
+        # Mock LLM output so this integration test is deterministic and offline.
+        # One grounded finding per document; other sections return no findings.
+        responses = [
+            {"findings": []},
+            {"findings": [{
+                "type": "risk",
+                "description": "Third-party integration costs may exceed budget",
+                "evidence_type": "fact",
+                "excerpt": "Budget overrun risk is high due to uncertain third-party integration costs",
+                "impact_assessment": "Budget impact",
+                "recommendations": "Review vendor costs",
+            }]},
+            {"findings": [{
+                "type": "assumption",
+                "description": "Legacy API remains stable",
+                "evidence_type": "fact",
+                "excerpt": "We assume the legacy system API will remain stable throughout the project",
+                "impact_assessment": "Integration impact",
+                "recommendations": "Validate API stability",
+            }]},
+            {"findings": []},
+        ]
+        provider = MagicMock()
+        provider.is_configured.return_value = True
+        provider.generate_response.side_effect = [
+            LLMResponse(content=json.dumps(payload), provider="mock", model="test")
+            for payload in responses
+        ]
+        with patch("src.workflow.langgraph_workflow.llm_factory.get_provider", return_value=provider):
+            individual_updates = workflow.analyze_individual_documents(state)
         state.update(individual_updates)
+        assert provider.generate_response.call_count == 4
+        assert not state["error_messages"]
         
         # Verify individual analyses created
         individual_analyses = state["individual_analyses"]
