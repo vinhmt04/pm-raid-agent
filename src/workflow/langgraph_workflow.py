@@ -469,7 +469,7 @@ class RAIDWorkflow:
                 "last_updated_at": datetime.now()
             }
     
-    # Helper Methods for LLM Integration (Stubs for now)
+    # Helper Methods for LLM Integration
     
     def _analyze_single_document(self,
                                  document: DocumentMetadata,
@@ -564,52 +564,189 @@ class RAIDWorkflow:
         )
 
     def _perform_cross_document_synthesis(self, state: WorkflowState) -> CrossDocumentSynthesis:
+        """Consolidate document candidates and inspect cross-source links using an LLM.
+
+        The model can only refer to numbered candidates. Source citations are
+        always copied from verified individual analyses, never model-generated.
         """
-        Perform cross-document synthesis of findings.
-        
-        This is a stub implementation. In the actual system, this would:
-        1. Use the configured LLM provider for comprehensive analysis
-        2. Compare findings across documents
-        3. Identify relationships and contradictions
-        4. Generate final consolidated findings
-        
-        Args:
-            state: Current workflow state
-            
-        Returns:
-            Cross-document synthesis results
-        """
-        # Stub implementation - would integrate with actual LLM provider
-        # Convert potential findings to RAIDFinding objects
-        synthesized_findings = []
-        
+        candidates = []
         for analysis in state["individual_analyses"]:
-            for finding_data in analysis.potential_findings:
-                # Create SourceCitation objects
-                citations = [
-                    SourceCitation(**citation) 
-                    for citation in finding_data["source_citations"]
-                ]
-                
-                # Create RAIDFinding
-                finding = RAIDFinding(
-                    type=RAIDType(finding_data["type"]),
-                    description=finding_data["description"],
-                    evidence_type=EvidenceType(finding_data["evidence_type"]),
-                    source_citations=citations,
-                    impact_assessment=finding_data.get("impact_assessment", ""),
-                    recommendations=finding_data.get("recommendations", "")
-                )
-                
-                synthesized_findings.append(finding)
-        
-        return CrossDocumentSynthesis(
-            synthesized_findings=synthesized_findings,
-            relationships_identified=[],  # Would be populated by LLM analysis
-            contradictions_found=[],      # Would be populated by LLM analysis
-            synthesis_summary="Cross-document synthesis completed"
-        )
-    
+            for raw in analysis.potential_findings:
+                try:
+                    citations = [SourceCitation(**c) if isinstance(c, dict) else c
+                                 for c in raw["source_citations"]]
+                    candidate = RAIDFinding(
+                        type=RAIDType(raw["type"]),
+                        description=raw["description"],
+                        evidence_type=EvidenceType(raw["evidence_type"]),
+                        source_citations=citations,
+                        impact_assessment=raw.get("impact_assessment", ""),
+                        recommendations=raw.get("recommendations", ""),
+                    )
+                    candidates.append(candidate)
+                except (KeyError, TypeError, ValueError) as exc:
+                    logger.warning("Skipping invalid document finding", error=str(exc))
+
+        if not candidates:
+            return CrossDocumentSynthesis([], [], [], "No valid RAID candidates")
+
+        # Preserve every grounded candidate when there is no model or when it
+        # fails; never silently invent relationships or contradictions.
+        def fallback(reason: str) -> CrossDocumentSynthesis:
+            return CrossDocumentSynthesis(candidates, [], [], reason)
+
+        # A single document does not provide cross-document evidence.
+        source_files = {c.filename for finding in candidates
+                        for c in finding.source_citations}
+        if len(source_files) < 2:
+            return fallback("Single-document findings; no cross-document synthesis")
+
+        try:
+            provider = llm_factory.get_provider()
+            if not provider.is_configured():
+                return fallback("LLM unavailable; retaining individual findings")
+
+            indexed = [
+                {"index": i, "type": f.type.value, "description": f.description,
+                 "evidence_type": f.evidence_type.value,
+                 "citations": [{"filename": c.filename, "location": c.location,
+                                "excerpt": c.excerpt} for c in f.source_citations]}
+                for i, f in enumerate(candidates)
+            ]
+            request = LLMRequest(
+                system_prompt=(
+                    "You are a project RAID evidence synthesis analyst. Compare "
+                    "the indexed findings from different documents. Output ONLY "
+                    "JSON with arrays 'groups', 'relationships', 'contradictions'. "
+                    "groups are arrays of integer candidate indices that refer to "
+                    "the SAME underlying RAID item; omit ungrouped indices. "
+                    "relationships contain {a, b, type} for two candidate indices "
+                    "with a supported relationship. contradictions contain "
+                    "{a, b, explanation} for directly conflicting evidence. "
+                    "Only use given indices. Never fabricate evidence. "
+                    "Use empty arrays if none are supported."
+                ),
+                messages=[{"role": "user", "content": json.dumps(indexed, ensure_ascii=False)}],
+                temperature=0,
+            )
+            raw = provider.generate_response(request).content.strip()
+            if raw.startswith("```"):
+                lines = raw.splitlines()
+                if len(lines) >= 3 and lines[-1].strip() == "```":
+                    raw = "\n".join(lines[1:-1])
+            payload = json.loads(raw)
+            if not isinstance(payload, dict) or not all(
+                isinstance(payload.get(key), list)
+                for key in ("groups", "relationships", "contradictions")
+            ):
+                raise ValueError("Invalid cross-document synthesis JSON schema")
+
+            def valid_index(value):
+                return type(value) is int and 0 <= value < len(candidates)
+
+            def cross_source(i, j):
+                left = {c.filename for c in candidates[i].source_citations}
+                right = {c.filename for c in candidates[j].source_citations}
+                return bool(left - right or right - left)
+
+            # Merge only disjoint, independently grounded duplicate groups.
+            used = set()
+            groups = []
+            for group in payload["groups"]:
+                if (not isinstance(group, list) or len(group) < 2
+                        or not all(valid_index(i) for i in group)
+                        or len(set(group)) != len(group)
+                        or any(i in used for i in group)
+                        or len({candidates[i].type for i in group}) != 1
+                        or len({c.filename for i in group
+                                for c in candidates[i].source_citations}) < 2):
+                    continue
+                groups.append(group)
+                used.update(group)
+
+            consolidated = []
+            index_to_finding = {}
+            for group in groups:
+                primary = candidates[group[0]]
+                citations = []
+                seen = set()
+                for i in group:
+                    for citation in candidates[i].source_citations:
+                        key = (citation.filename, citation.location, citation.excerpt)
+                        if key not in seen:
+                            seen.add(key)
+                            citations.append(citation)
+                primary.source_citations = citations
+                primary.metadata["merged_candidate_indices"] = list(group)
+                consolidated.append(primary)
+                for i in group:
+                    index_to_finding[i] = primary
+            for i, candidate in enumerate(candidates):
+                if i not in used:
+                    consolidated.append(candidate)
+                    index_to_finding[i] = candidate
+
+            relationships = []
+            contradictions = []
+            seen_pairs = set()
+            for item in payload["relationships"]:
+                if not isinstance(item, dict):
+                    continue
+                i, j = item.get("a"), item.get("b")
+                relation_type = item.get("type")
+                if (not valid_index(i) or not valid_index(j) or i == j
+                        or not cross_source(i, j)
+                        or not isinstance(relation_type, str)
+                        or not relation_type.strip()):
+                    continue
+                first, second = index_to_finding[i], index_to_finding[j]
+                if first.id == second.id:
+                    continue
+                key = tuple(sorted((first.id, second.id)))
+                if key not in seen_pairs:
+                    seen_pairs.add(key)
+                    relationships.append({"finding_id1": first.id,
+                                          "finding_id2": second.id,
+                                          "relationship_type": relation_type.strip()})
+
+            seen_contradictions = set()
+            for item in payload["contradictions"]:
+                if not isinstance(item, dict):
+                    continue
+                i, j = item.get("a"), item.get("b")
+                explanation = item.get("explanation")
+                if (not valid_index(i) or not valid_index(j) or i == j
+                        or not cross_source(i, j)
+                        or not isinstance(explanation, str)
+                        or not explanation.strip()):
+                    continue
+                first, second = index_to_finding[i], index_to_finding[j]
+                key = tuple(sorted((i, j)))
+                if key not in seen_contradictions:
+                    seen_contradictions.add(key)
+                    contradictions.append({"finding_id1": first.id,
+                                           "finding_id2": second.id,
+                                           "explanation": explanation.strip(),
+                                           "source_citations": [
+                                               {"filename": c.filename,
+                                                "location": c.location,
+                                                "excerpt": c.excerpt}
+                                               for c in (candidates[i].source_citations
+                                                         + candidates[j].source_citations)]})
+            return CrossDocumentSynthesis(
+                synthesized_findings=consolidated,
+                relationships_identified=relationships,
+                contradictions_found=contradictions,
+                synthesis_summary=(f"Synthesized {len(candidates)} candidates into "
+                                   f"{len(consolidated)} findings; "
+                                   f"{len(relationships)} relationships and "
+                                   f"{len(contradictions)} contradictions"),
+            )
+        except Exception as exc:
+            logger.warning("Cross-document LLM synthesis failed; preserving findings",
+                           error=str(exc))
+            return fallback(f"Cross-document synthesis unavailable: {exc}")
+
     def _classify_finding_evidence(self, state: WorkflowState) -> Dict[str, str]:
         """
         Classify evidence for all findings.
