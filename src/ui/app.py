@@ -329,9 +329,82 @@ def render_review_page() -> None:
         st.success("PM review completed. Approved findings are ready for export.")
 
 
+def prepare_approved_export(workflow, thread_config, service=None):
+    """Use the persisted workflow checkpoint, never editable UI state."""
+    from src.export.export_service import RAIDExportService, NoApprovedFindingsError
+
+    if workflow is None or not thread_config:
+        raise ValueError("Complete RAID analysis and PM review before exporting.")
+    state, findings, interrupted = get_review_snapshot(workflow, thread_config)
+    if state is None:
+        raise ValueError("No workflow checkpoint is available for export.")
+    if interrupted or not state.get("approval_complete", False):
+        raise ValueError("Complete PM approval before exporting RAID findings.")
+    if state.get("workflow_status") == "error":
+        raise ValueError("Cannot export a failed RAID workflow.")
+    manager = state.get("raid_state_manager")
+    if manager is None:
+        raise ValueError("RAID findings are missing from the workflow checkpoint.")
+    export_service = service if service is not None else RAIDExportService()
+    return export_service.prepare_download(manager)
+
+
 def render_export_page() -> None:
     st.header("Export approved RAID findings")
-    st.info("Excel download controls will be connected in Task 9.4.")
+    workflow = st.session_state.raid_workflow
+    config = st.session_state.raid_thread_config
+    if workflow is None or not config:
+        st.info("Analyze documents and complete PM review before exporting.")
+        return
+    try:
+        state, findings, interrupted = get_review_snapshot(workflow, config)
+    except Exception as exc:
+        st.error(f"Cannot load export status: {exc}")
+        return
+    if state is None:
+        st.warning("No workflow checkpoint found.")
+        return
+    approved = [finding for finding in findings if finding.status.value == "approved"]
+    st.write(f"Approved findings: {len(approved)} / {len(findings)}")
+    if interrupted or not state.get("approval_complete", False):
+        st.warning("Finish PM review and approval before exporting.")
+        return
+    if state.get("workflow_status") == "error":
+        st.error("Workflow failed. Excel export is unavailable.")
+        return
+    if not approved:
+        st.info("No approved findings to export. Rejected findings are excluded.")
+        return
+
+    # Keep prepared bytes across Streamlit reruns, but invalidate if checkpoint changes.
+    snapshot_signature = tuple(sorted(
+        (f.id, f.status.value, f.description, f.recommendations)
+        for f in findings
+    ))
+    cached = st.session_state.raid_export_result
+    if cached is not None and cached[0] != snapshot_signature:
+        st.session_state.raid_export_result = None
+        cached = None
+    if st.button("Generate Excel export", key="raid_generate_export"):
+        try:
+            result = prepare_approved_export(workflow, config)
+            st.session_state.raid_export_result = (snapshot_signature, result)
+            cached = st.session_state.raid_export_result
+        except Exception as exc:
+            st.session_state.raid_export_result = None
+            st.error(f"Excel export failed: {exc}")
+            return
+    if cached is not None:
+        result = cached[1]
+        st.success(result.message)
+        st.download_button(
+            "Download approved RAID Excel",
+            data=result.data,
+            file_name=result.filename,
+            mime=result.mime_type,
+            key="raid_download_excel",
+        )
+        st.caption("Only approved RAID findings are included in the workbook.")
 
 
 def main() -> None:
