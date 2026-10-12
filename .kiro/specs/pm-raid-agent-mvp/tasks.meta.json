@@ -55,6 +55,18 @@
         "chatSessionId": "sess_a6ad871f-2616-4051-9cef-6a31bb745f91",
         "timestamp": 1791771953820
       }
+    ],
+    "6.1 Create workflow state and nodes structure": [
+      {
+        "executionId": "2de57a21-e9ec-47be-baa9-d057cde002d5",
+        "chatSessionId": "sess_a6ad871f-2616-4051-9cef-6a31bb745f91",
+        "timestamp": 1791772185348
+      },
+      {
+        "executionId": "2de57a21-e9ec-47be-baa9-d057cde002d5",
+        "chatSessionId": "sess_a6ad871f-2616-4051-9cef-6a31bb745f91",
+        "timestamp": 1791772470630
+      }
     ]
   }
 }

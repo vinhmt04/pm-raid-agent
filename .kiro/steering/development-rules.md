@@ -30,3 +30,10 @@ inclusion: always
 - Never claim tests passed unless they were executed successfully.
 - Report files changed, completed work, and remaining issues.
 - Stop after the assigned task and wait for further instructions.
+
+## 5. Tool Execution
+- Environment: Windows PowerShell 5.1.
+- Prefer native IDE tools for file operations.
+- Use only PowerShell 5.1-compatible commands.
+- Do not use Bash-specific syntax or options.
+- If a tool operation fails twice, stop and report the blocker.
