@@ -8,6 +8,9 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 from uuid import uuid4
+from tempfile import TemporaryDirectory
+from dataclasses import dataclass
+from typing import Any
 
 import streamlit as st
 
@@ -27,6 +30,9 @@ def initialize_session_state() -> None:
         "raid_session_id": None,
         "raid_uploaded_files": [],
         "raid_documents": [],
+        "raid_processing_results": [],
+        "raid_processing_errors": [],
+        "raid_processed_fingerprint": None,
         "raid_workflow": None,
         "raid_thread_config": None,
         "raid_workflow_state": None,
@@ -55,6 +61,54 @@ def validate_uploads(files) -> list[str]:
     return errors
 
 
+@dataclass
+class ProcessingResult:
+    filename: str
+    status: str
+    sections: int
+    characters: int
+    error: str = ""
+
+
+def process_uploaded_documents(files, factory=None):
+    """Parse uploads via existing document processors; isolate individual failures.
+
+    Only validated files are written to a short-lived private temporary folder.
+    File names are generated, preventing directory traversal and collisions.
+    """
+    errors = validate_uploads(files)
+    if errors:
+        raise ValueError("; ".join(errors))
+    if factory is None:
+        from src.document_processing.factory import DocumentProcessorFactory
+        factory = DocumentProcessorFactory()
+
+    documents, results = [], []
+    with TemporaryDirectory(prefix="raid_upload_") as temp_dir:
+        for index, upload in enumerate(files):
+            original_name = str(upload.name)
+            suffix = "." + original_name.rsplit(".", 1)[-1].lower()
+            temp_path = Path(temp_dir) / f"document_{index}{suffix}"
+            try:
+                # Streamlit UploadedFile.getvalue() does not alter stream position.
+                payload = upload.getvalue() if hasattr(upload, "getvalue") else upload.read()
+                if not isinstance(payload, bytes) or not payload:
+                    raise ValueError("File is empty or cannot be read")
+                temp_path.write_bytes(payload)
+                metadata = factory.process_document(temp_path)
+                metadata.filename = original_name
+                status = str(metadata.processing_status)
+                sections = len(metadata.content_sections)
+                characters = sum(len(section.text) for section in metadata.content_sections)
+                results.append(ProcessingResult(original_name, status, sections,
+                                                characters, metadata.error_message or ""))
+                if status in ("success", "partial_success") and sections:
+                    documents.append(metadata)
+            except Exception as exc:
+                results.append(ProcessingResult(original_name, "error", 0, 0, str(exc)))
+    return documents, results
+
+
 def render_upload_page() -> None:
     st.header("Upload project documents")
     files = st.file_uploader(
@@ -75,7 +129,39 @@ def render_upload_page() -> None:
     st.success(f"{len(files)} document(s) selected.")
     for file in files:
         st.write(f"• {file.name}")
-    st.caption("Document processing and analysis will be connected in Task 9.2.")
+
+    if st.button("Process documents", key="raid_process_documents"):
+        # Invalidate stale review/export state when processing a new batch.
+        st.session_state.raid_documents = []
+        st.session_state.raid_processing_results = []
+        st.session_state.raid_processing_errors = []
+        st.session_state.raid_workflow = None
+        st.session_state.raid_workflow_state = None
+        st.session_state.raid_thread_config = None
+        st.session_state.raid_review_decisions = {}
+        st.session_state.raid_export_result = None
+        with st.spinner("Extracting document content..."):
+            documents, results = process_uploaded_documents(files)
+        st.session_state.raid_documents = documents
+        st.session_state.raid_processing_results = results
+        st.session_state.raid_processing_errors = [r.error for r in results if r.error]
+
+    results = st.session_state.raid_processing_results
+    if results:
+        st.subheader("Processing results")
+        for result in results:
+            message = (f"{result.filename}: {result.status} — "
+                       f"{result.sections} sections, {result.characters} characters")
+            if result.status == "success":
+                st.success(message)
+            elif result.status == "partial_success":
+                st.warning(message)
+            else:
+                st.error(message)
+            if result.error:
+                st.caption(result.error)
+        st.info(f"{len(st.session_state.raid_documents)} document(s) ready for RAID analysis.")
+        st.caption("Start LangGraph analysis will be connected in Task 11.1.")
 
 
 def render_review_page() -> None:
