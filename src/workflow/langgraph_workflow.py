@@ -326,6 +326,8 @@ class RAIDWorkflow:
             
             updates = {
                 "cross_document_synthesis": synthesis_result,
+                # Explicitly persist mutated manager across LangGraph checkpoints.
+                "raid_state_manager": state["raid_state_manager"],
                 "current_phase": "classification",
                 "last_updated_at": datetime.now()
             }
@@ -377,6 +379,8 @@ class RAIDWorkflow:
                     finding.updated_at = datetime.now()
             
             updates = {
+                # Classification mutates finding objects; persist the manager too.
+                "raid_state_manager": state["raid_state_manager"],
                 "current_phase": "review",
                 "last_updated_at": datetime.now()
             }
